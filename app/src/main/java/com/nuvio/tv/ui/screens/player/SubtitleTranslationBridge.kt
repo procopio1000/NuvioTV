@@ -220,6 +220,7 @@ internal class SubtitleTranslationSession(
 
         val activeProvider = provider ?: return
         val activeTarget = targetLanguage ?: return
+        val activeSource = sourceLanguage
         val generation = ++cueGeneration
         val cues = cueGroup.cues
         if (cues.isEmpty()) return
@@ -231,7 +232,9 @@ internal class SubtitleTranslationSession(
         if (textIndexes.isEmpty()) return
 
         val texts = textIndexes.map { index -> cues[index].text!!.toString() }
-        val cachedTranslations = texts.map { text -> cache[cacheKey(text, activeTarget)] }
+        val cachedTranslations = texts.map { text ->
+            cache[cacheKey(activeProvider.addonId, activeSource, activeTarget, text)]
+        }
         if (cachedTranslations.all { it != null }) {
             renderTranslatedCues(
                 original = cues,
@@ -246,7 +249,7 @@ internal class SubtitleTranslationSession(
             val translations = try {
                 translateBatch(
                     provider = activeProvider,
-                    sourceLanguage = sourceLanguage,
+                    sourceLanguage = activeSource,
                     targetLanguage = activeTarget,
                     texts = texts
                 )
@@ -259,7 +262,7 @@ internal class SubtitleTranslationSession(
 
             if (translations.size != texts.size) return@launch
             texts.forEachIndexed { index, text ->
-                cache[cacheKey(text, activeTarget)] = translations[index]
+                cache[cacheKey(activeProvider.addonId, activeSource, activeTarget, text)] = translations[index]
             }
             renderTranslatedCues(
                 original = cues,
@@ -290,8 +293,12 @@ internal class SubtitleTranslationSession(
         }
     }
 
-    private fun cacheKey(text: String, targetLanguage: String): String =
-        "${sourceLanguage.orEmpty()}|$targetLanguage|$text"
+    private fun cacheKey(
+        providerId: String,
+        sourceLanguage: String?,
+        targetLanguage: String,
+        text: String
+    ): String = "$providerId|${sourceLanguage.orEmpty()}|$targetLanguage|$text"
 
     private suspend fun translateBatch(
         provider: SubtitleTranslationProvider,
