@@ -1,0 +1,64 @@
+name: Validate Subtitle Translation Cache Fix
+
+on:
+  push:
+    branches:
+      - feat/embedded-subtitle-translation-bridge
+    paths:
+      - scripts/fix_subtitle_translation_cache_scope.py
+      - .github/workflows/fix-subtitle-translation-cache-scope.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout feature branch
+        uses: actions/checkout@v4
+        with:
+          ref: feat/embedded-subtitle-translation-bridge
+          fetch-depth: 0
+
+      - name: Apply cache race fix
+        run: python3 scripts/fix_subtitle_translation_cache_scope.py
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Prepare local properties
+        env:
+          LOCAL_PROPERTIES_BASE64: ${{ secrets.LOCAL_PROPERTIES_BASE64 }}
+          LOCAL_DEV_PROPERTIES_BASE64: ${{ secrets.LOCAL_DEV_PROPERTIES_BASE64 }}
+        run: |
+          if [ -n "$LOCAL_PROPERTIES_BASE64" ]; then
+            printf '%s' "$LOCAL_PROPERTIES_BASE64" | base64 --decode > local.properties
+          else
+            touch local.properties
+          fi
+          if [ -n "$LOCAL_DEV_PROPERTIES_BASE64" ]; then
+            printf '%s' "$LOCAL_DEV_PROPERTIES_BASE64" | base64 --decode > local.dev.properties
+          else
+            touch local.dev.properties
+          fi
+
+      - name: Compile fullDebug Kotlin
+        run: ./gradlew :app:compileFullDebugKotlin --stacktrace
+
+      - name: Commit validated fix
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app/src/main/java/com/nuvio/tv/ui/screens/player/SubtitleTranslationBridge.kt
+          if git diff --cached --quiet; then
+            echo "No bridge changes to commit"
+          else
+            git commit -m "fix(player): scope translation cache to active session inputs"
+            git push origin HEAD:feat/embedded-subtitle-translation-bridge
+          fi
