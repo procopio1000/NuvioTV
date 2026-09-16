@@ -75,6 +75,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -180,6 +181,77 @@ fun PlayerScreen(
     var reportCodeVisible by remember { mutableStateOf(false) }
     var exitDispatched by remember { mutableStateOf(false) }
     var externalHandoffInProgress by remember { mutableStateOf(false) }
+
+    // Embedded subtitle translation stays session-scoped and opt-in. The bridge discovers
+    // a compatible installed addon by its manifest resource and never receives the video URL.
+    val subtitleTranslationScope = rememberCoroutineScope()
+    val subtitleTranslationSession = remember(subtitleTranslationScope) {
+        SubtitleTranslationSession(subtitleTranslationScope)
+    }
+    val installedAddons by viewModel.controller.addonRepository
+        .getInstalledAddons()
+        .collectAsState(initial = emptyList())
+    val subtitleTranslationProvider = remember(installedAddons) {
+        findSubtitleTranslationProvider(installedAddons)
+    }
+    val subtitleTranslationTargetLanguage = remember(uiState.subtitleStyle.preferredLanguage) {
+        resolveSubtitleTranslationTargetLanguage(uiState.subtitleStyle.preferredLanguage)
+    }
+    val subtitleTranslationSource = remember(
+        uiState.subtitleTracks,
+        uiState.selectedSubtitleTrackIndex,
+        subtitleTranslationTargetLanguage
+    ) {
+        subtitleTranslationTargetLanguage?.let { targetLanguage ->
+            chooseSubtitleTranslationSource(
+                tracks = uiState.subtitleTracks,
+                selectedInternalIndex = uiState.selectedSubtitleTrackIndex,
+                targetLanguage = targetLanguage
+            )
+        }
+    }
+    val subtitleTranslationSupported =
+        uiState.internalPlayerEngine != InternalPlayerEngine.MVP_PLAYER &&
+            !uiState.useLibass &&
+            subtitleTranslationProvider != null &&
+            subtitleTranslationTargetLanguage != null &&
+            subtitleTranslationSource != null
+    val subtitleTranslationOption = remember(
+        subtitleTranslationProvider,
+        subtitleTranslationTargetLanguage,
+        subtitleTranslationSupported
+    ) {
+        if (!subtitleTranslationSupported) {
+            null
+        } else {
+            buildSubtitleTranslationOption(
+                provider = requireNotNull(subtitleTranslationProvider),
+                targetLanguage = requireNotNull(subtitleTranslationTargetLanguage)
+            )
+        }
+    }
+    val subtitleOptionsWithTranslation = remember(uiState.addonSubtitles, subtitleTranslationOption) {
+        val base = uiState.addonSubtitles.filterNot(Subtitle::isSubtitleTranslationOption)
+        subtitleTranslationOption?.let { base + it } ?: base
+    }
+
+    DisposableEffect(viewModel.exoPlayer, subtitleTranslationSession) {
+        val player = viewModel.exoPlayer
+        subtitleTranslationSession.attachPlayer(player)
+        onDispose { subtitleTranslationSession.detachPlayer(player) }
+    }
+    DisposableEffect(subtitleTranslationSession) {
+        onDispose { subtitleTranslationSession.close() }
+    }
+    LaunchedEffect(
+        subtitleTranslationSupported,
+        subtitleTranslationProvider?.addonId,
+        subtitleTranslationTargetLanguage
+    ) {
+        if (!subtitleTranslationSupported && subtitleTranslationSession.isEnabled) {
+            subtitleTranslationSession.disable()
+        }
+    }
 
     val exitPlayer: () -> Unit = exitPlayer@{
         if (exitDispatched) return@exitPlayer
@@ -907,7 +979,10 @@ fun PlayerScreen(
                             useLibass = uiState.useLibass,
                             libassRenderType = uiState.libassRenderType,
                             subtitleStyle = uiState.subtitleStyle,
-                            onBindSubtitleView = viewModel::bindExoSubtitleView,
+                            onBindSubtitleView = { subtitleView ->
+                                viewModel.bindExoSubtitleView(subtitleView)
+                                subtitleTranslationSession.bindSubtitleView(subtitleView)
+                            },
                             modifier = Modifier.fillMaxSize()
                         )
                     }
@@ -1579,17 +1654,46 @@ fun PlayerScreen(
             visible = uiState.showSubtitleOverlay,
             internalTracks = uiState.subtitleTracks,
             selectedInternalIndex = uiState.selectedSubtitleTrackIndex,
-            addonSubtitles = uiState.addonSubtitles,
-            selectedAddonSubtitle = uiState.selectedAddonSubtitle,
+            addonSubtitles = subtitleOptionsWithTranslation,
+            selectedAddonSubtitle = if (subtitleTranslationSession.isEnabled) {
+                subtitleTranslationOption
+            } else {
+                uiState.selectedAddonSubtitle
+            },
             subtitleStyle = uiState.subtitleStyle,
             subtitleDelayMs = uiState.subtitleDelayMs,
             installedSubtitleAddonOrder = uiState.installedSubtitleAddonOrder,
             isLoadingAddons = uiState.isLoadingAddonSubtitles,
             useLibass = uiState.useLibass,
             isUsingMpv = uiState.internalPlayerEngine == InternalPlayerEngine.MVP_PLAYER,
-            onInternalTrackSelected = { viewModel.onEvent(PlayerEvent.OnSelectSubtitleTrack(it)) },
-            onAddonSubtitleSelected = { viewModel.onEvent(PlayerEvent.OnSelectAddonSubtitle(it)) },
-            onDisableSubtitles = { viewModel.onEvent(PlayerEvent.OnDisableSubtitles) },
+            onInternalTrackSelected = { trackIndex ->
+                subtitleTranslationSession.disable()
+                viewModel.onEvent(PlayerEvent.OnSelectSubtitleTrack(trackIndex))
+            },
+            onAddonSubtitleSelected = { subtitle ->
+                if (subtitle.isSubtitleTranslationOption()) {
+                    val provider = subtitleTranslationProvider
+                    val targetLanguage = subtitleTranslationTargetLanguage
+                    val source = subtitleTranslationSource
+                    if (provider != null && targetLanguage != null && source != null) {
+                        // Select the embedded source track without persisting it as the user's
+                        // explicit subtitle preference. The UI remains on the translation option.
+                        viewModel.controller.selectSubtitleTrack(source.index)
+                        subtitleTranslationSession.enable(
+                            provider = provider,
+                            targetLanguage = targetLanguage,
+                            sourceLanguage = source.language
+                        )
+                    }
+                } else {
+                    subtitleTranslationSession.disable()
+                    viewModel.onEvent(PlayerEvent.OnSelectAddonSubtitle(subtitle))
+                }
+            },
+            onDisableSubtitles = {
+                subtitleTranslationSession.disable()
+                viewModel.onEvent(PlayerEvent.OnDisableSubtitles)
+            },
             onEvent = { viewModel.onEvent(it) },
             onDismiss = { viewModel.onEvent(PlayerEvent.OnDismissTransientOverlay) },
             modifier = Modifier
